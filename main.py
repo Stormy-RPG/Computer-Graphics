@@ -2,8 +2,9 @@ import numpy as np
 from os import PathLike
 from typing import List
 from math import floor, ceil, sin, cos, radians
-from PIL import Image
-
+from PIL import Image, ImageTk
+import tkinter as tk
+from numba import njit
 
 
 def render_model(img_mat, z_buf, v, f, light_vector, scale, shift_y, shift_x):
@@ -59,6 +60,8 @@ class Renderer:
         self.z_buf = np.full((height, width), np.inf, dtype=np.float32)
 
     def render(self, scene: Scene):
+        self.img_mat.fill(0)
+        self.z_buf.fill(np.inf)
         render_model(self.img_mat, self.z_buf, scene.v, scene.f, scene.light_vector, self.scale, self.shift_y, self.shift_x)
         pass
 
@@ -111,8 +114,78 @@ class Renderer:
                         z_buf[y, x] = zpol
 
 
+class App:
+    def __init__(self, scene: Scene, renderer: Renderer, win_w = 1000, win_h = 1000):
+            self.scene = scene
+            self.renderer = renderer
+    
+            # Окно верхнего уровня
+            self.root = tk.Tk()
+            # Размеры окна
+            self.root.geometry(f"{win_w}x{win_h}")
+            # Область для рисования внутри окна
+            self.canvas = tk.Canvas(self.root, bg='black', highlightthickness=0)
+            self.canvas.pack(fill='both', expand=True)
+            self.canvas.focus_set()
+            # Обновление изображения при изменении размеров окна
+            self.canvas.bind('<Configure>', lambda e: self._refit())
+            # Привязка обработчика клавиш
+            self.root.bind('<Key>', self.on_key)
+    
+            # Изображение внутри окна
+            self.photo = None
+            self.full_image = None
+    
+            self.render()
+
+    def on_key(self, event):
+            k = event.keysym
+    
+            if k == 'plus':
+                self.renderer.scale *= 1.1
+            elif k == 'minus':
+                self.renderer.scale /= 1.1
+            elif k == 'space':
+                self.renderer.save_image('imgs\\app_output.png')
+                return 'break'
+            else:
+                return
+    
+            self.render()
+            # Не обрабатываем дальше – return 'brake'
+            return 'break'
+
+    def render(self):
+        self.renderer.render(self.scene)
+        self.full_image = Image.fromarray(self.renderer.img_mat)
+        self._refit()
+
+    def _refit(self):
+        # Если ещё не отрендерилось, пропускаем
+        if self.full_image is None: return
+        # Ширина и высота области для рисования
+        ww = self.canvas.winfo_width()
+        wh = self.canvas.winfo_height()
+        # Если вдруг сделали область слишком маленькой
+        if ww < 10 or wh < 10: return
+        # Вписать с сохранением пропорций
+        s = min(ww / self.renderer.W, wh / self.renderer.H)
+        dw = max(1, int(self.renderer.W * s))
+        dh = max(1, int(self.renderer.H * s))
+        disp = self.full_image.resize((dw, dh), Image.BILINEAR)
+        # Очень важно сохранить ImageTk.PhotoImage(disp) в поле класса
+        # Если оно будет локальным, то удалится после выхода сборщиком мусора
+        self.photo = ImageTk.PhotoImage(disp)
+        self.canvas.delete('all')
+        self.canvas.create_image(ww // 2, wh // 2, image=self.photo)   
+    
+    def run(self):
+        self.root.mainloop()
+
+
 if __name__ == '__main__':
     scene = Scene('model.obj', 180)
     renderer = Renderer(1000, 1000, 7000)
-    renderer.render(scene)
-    renderer.save_image('imgs\\output.png')
+    # renderer.render(scene)
+    # renderer.save_image('imgs\\output.png')
+    App(scene, renderer, 500, 500).run()
