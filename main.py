@@ -1,117 +1,131 @@
 import numpy as np
 from os import PathLike
-from typing import List
-from math import floor, ceil, sin, cos, radians
+from math import floor, ceil, sin, cos, radians, sqrt
 from PIL import Image, ImageTk
 import tkinter as tk
 from numba import njit
 
 
+@njit(cache=True)
+def print_triangle(img_mat, z_buf, py0, px0, py1, px1, py2, px2, z0, z1, z2, base_color, canvas_width, canvas_height):
+    # Знаменатель барицентрических координат для одного треугольника
+    dinom = ((px0 - px2) * (py1 - py2) - (px1 - px2) * (py0 - py2))
+    if dinom == 0.0:
+        return
+
+    xmin = int(floor(min(px0, min(px1, px2))))
+    xmax = int(ceil(max(px0, max(px1, px2))))
+    ymin = int(floor(min(py0, min(py1, py2))))
+    ymax = int(ceil(max(py0, max(py1, py2))))
+
+    if xmin < 0: xmin = 0
+    if ymin < 0: ymin = 0
+    if xmax > canvas_width - 1: xmax = canvas_width - 1
+    if ymax > canvas_height - 1: ymax = canvas_height - 1
+
+    for y in range(ymin, ymax + 1):
+        for x in range(xmin, xmax + 1):
+            # Бароцентрические координаты
+            h0 = ((x - px2) * (py1 - py2) - (px1 - px2) * (y - py2)) / dinom
+            h1 = ((px0 - px2) * (y - py2) - (x - px2) * (py0 - py2)) / dinom
+            h2 = 1.0 - h0 - h1
+
+            if (h0 >= 0.0) and (h1 >= 0.0) and (h2 >= 0.0):
+                zpol = h0*z0 + h1*z1 + h2*z2
+
+                if zpol < z_buf[y, x]:
+                    img_mat[y, x, :] = base_color
+                    z_buf[y, x] = zpol
+
+
+@njit(cache=True)
 def render_model(img_mat, z_buf, v, f, light_vector, scale, shift_y, shift_x):
-    for i in range(len(f)):
+    H = img_mat.shape[0]
+    W = img_mat.shape[1]
+
+    lx = light_vector[0]
+    ly = light_vector[1]
+    lz = light_vector[2]
+    l_norm = sqrt(lx * lx + ly * ly + lz * lz)
+
+    for i in range(f.shape[0]):
+        i0, i1, i2 = f[i, 0], f[i, 1], f[i, 2]
+
         # Мировые координаты вершин треугольника
-        x0, y0, z0 = v[f[i][0]]
-        x1, y1, z1 = v[f[i][1]]
-        x2, y2, z2 = v[f[i][2]]
+        x0, y0, z0 = v[i0, 0], v[i0, 1], v[i0, 2]
+        x1, y1, z1 = v[i1, 0], v[i1, 1], v[i1, 2]
+        x2, y2, z2 = v[i2, 0], v[i2, 1], v[i2, 2]
 
         # Переводим мировые координаты в экранные
-        py0, px0 = -y0*scale+shift_y, x0*scale+shift_x
-        py1, px1 = -y1*scale+shift_y, x1*scale+shift_x
-        py2, px2 = -y2*scale+shift_y, x2*scale+shift_x
+        py0 = -y0 * scale + shift_y; px0 = x0 * scale + shift_x
+        py1 = -y1 * scale + shift_y; px1 = x1 * scale + shift_x
+        py2 = -y2 * scale + shift_y; px2 = x2 * scale + shift_x
 
-        
-        n = Renderer.triangle_normal(x0, y0, z0, x1, y1, z1, x2, y2, z2)
-        light_cos = np.dot(n, light_vector) / (np.linalg.norm(n) * np.linalg.norm(light_vector))
+        # Нормаль к треугольнику (векторное произведение двух сторон)
+        ax = x1 - x2; ay = y1 - y2; az = z1 - z2
+        bx = x1 - x0; by = y1 - y0; bz = z1 - z0
+        nx = ay * bz - az * by
+        ny = az * bx - ax * bz
+        nz = ax * by - ay * bx
 
-        if light_cos < 0:
-            Renderer.print_triangle(img_mat, z_buf, py0, px0, py1, px1, py2, px2, [z0, z1, z2], base_color=[-255*light_cos, -255*light_cos, -255*light_cos])
+        n_norm = sqrt(nx * nx + ny * ny + nz * nz)
+        if n_norm == 0.0:
+            continue
+
+        light_cos = (nx * lx + ny * ly + nz * lz) / (n_norm * l_norm)
+
+        if light_cos < 0.0:
+            color = np.uint8(-255.0 * light_cos)
+            print_triangle(img_mat, z_buf, py0, px0, py1, px1, py2, px2, z0, z1, z2, color, W, H)
+
+
+
 
 class Scene:
-    def __init__(self, filename: str | bytes | PathLike, rotation_angle: float = 0, light_vector = np.array((0, 0, 1))):
-        self.v = []
-        self.f = []
-        self.light_vector = light_vector
+    def __init__(self, filename: str | bytes | PathLike, rotation_angle: float = 0, light_vector = (0.0, 0.0, 1.0)):
+        self.light_vector = np.array(light_vector, dtype=np.float64)
         self.rotation_angle = rotation_angle
-        self.alpha = radians(rotation_angle)
+
+        v = []
+        f = []
 
         with open(filename, "r") as file:
             for s in file:
                 sp = s.split()
                 
                 if sp[0] == "v":
-                    self.v.append([float(sp[1]), float(sp[2]), float(sp[3])])
+                    v.append([float(sp[1]), float(sp[2]), float(sp[3])])
 
                 if sp[0] == "f":
-                    self.f.append([int(sp[1].split("/")[0]) - 1, int(sp[2].split("/")[0]) - 1, int(sp[3].split("/")[0]) - 1])
-        
+                    f.append([int(sp[1].split("/")[0]) - 1, int(sp[2].split("/")[0]) - 1, int(sp[3].split("/")[0]) - 1])
+
+        # Однородные numpy-массивы вместо списков списков для njit
+        self.v = np.array(v, dtype=np.float64)
+        self.f = np.array(f, dtype=np.int64)
+
         # Поворот модели на ALPHA градусов вокруг оси Oy
-        for i in range(len(self.v)):
-            x, y, z = self.v[i]
-            self.v[i] = [x * cos(self.alpha) + z * sin(self.alpha), y, -x * sin(self.alpha) + z * cos(self.alpha)]
+        x = self.v[:, 0].copy()
+        z = self.v[:, 2].copy()
+        self.v[:, 0] = x * cos(radians(rotation_angle)) + z * sin(radians(rotation_angle))
+        self.v[:, 2] = -x * sin(radians(rotation_angle)) + z * cos(radians(rotation_angle))
 
 
 class Renderer:
-    def __init__(self, width: int = 1000, height: int = 1000, scale: int = 7000, shifts: List = [900, 500]):
+    def __init__(self, width: int = 1000, height: int = 1000, scale: int = 7000, shifts = (900, 500)):
         self.W = width
         self.H = height
-        self.scale = scale
-        self.shift_x, self.shift_y = shifts[1], shifts[0]
+        self.scale = float(scale)
+        self.shift_x, self.shift_y = float(shifts[1]), float(shifts[0])
         self.img_mat = np.zeros((height, width, 3), dtype=np.uint8)
         self.z_buf = np.full((height, width), np.inf, dtype=np.float32)
 
     def render(self, scene: Scene):
         self.img_mat.fill(0)
         self.z_buf.fill(np.inf)
-        render_model(self.img_mat, self.z_buf, scene.v, scene.f, scene.light_vector, self.scale, self.shift_y, self.shift_x)
-        pass
+        render_model(self.img_mat, self.z_buf, scene.v, scene.f, scene.light_vector, float(self.scale), float(self.shift_y), float(self.shift_x))
 
     def save_image(self, filename: str | bytes | PathLike):
-        img = Image.fromarray(self.img_mat)
-        img.save(filename)
-
-
-    @staticmethod
-    def bar_coords(y, x, y0, x0, y1, x1, y2, x2):
-        dinom = ((x0 - x2) * (y1 - y2) - (x1 - x2) * (y0 - y2))
-
-        lambda0 = ((x - x2) * (y1 - y2) - (x1 - x2) * (y - y2)) / dinom
-        lambda1 = ((x0 - x2) * (y - y2) - (x - x2) * (y0 - y2)) / dinom
-        lambda2 = 1.0 - lambda0 - lambda1
-
-        return lambda0, lambda1, lambda2
-
-    @staticmethod
-    def triangle_normal(x0, y0, z0, x1, y1, z1, x2, y2, z2):
-        a = np.array([x1 - x2, y1 - y2, z1 - z2])
-        b = np.array([x1 - x0, y1 - y0, z1 - z0])
-        return np.cross(a, b)
-
-    @staticmethod
-    # Подаём на вход вещественные координаты вершин. Учесть, что они положительные.
-    def print_triangle(img_mat, z_buf, py0, px0, py1, px1, py2, px2, z_param: List[float], canvas_width = 999, canvas_height = 999, base_color = [255, 255, 255]):
-        xmin = floor(min(px0, px1, px2))
-        xmax = ceil(max(px0, px1, px2))
-        ymin = floor(min(py0, py1, py2))
-        ymax = ceil(max(py0, py1, py2))
-
-        z0, z1, z2 = z_param
-
-        if (xmin < 0): xmin = 0
-        if (ymin < 0): ymin = 0
-        if (xmax > canvas_width): xmax = canvas_width
-        if (ymax > canvas_height): ymax = canvas_height
-
-        # Сама отрисовка 
-        for y in range(ymin, ymax + 1):
-            for x in range(xmin, xmax + 1):
-                h0, h1, h2 = Renderer.bar_coords(y, x, py0, px0, py1, px1, py2, px2)
-
-                if (h0 >= 0) and (h1 >= 0) and (h2 >= 0):
-                    zpol = h0*z0 + h1*z1 + h2*z2
-
-                    if zpol < z_buf[y, x]:
-                        img_mat[y, x] = base_color
-                        z_buf[y, x] = zpol
+        Image.fromarray(self.img_mat).save(filename)
 
 
 class App:
@@ -145,6 +159,11 @@ class App:
                 self.renderer.scale *= 1.1
             elif k == 'minus':
                 self.renderer.scale /= 1.1
+            # TODO
+            # elif k == 'q':
+            #     self.scene.rotation_angle -= 10
+            # elif k == 'e':
+            #     self.scene.rotation_angle += 10
             elif k == 'space':
                 self.renderer.save_image('imgs\\app_output.png')
                 return 'break'
