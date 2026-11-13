@@ -39,7 +39,7 @@ def print_triangle(img_mat, z_buf, py0, px0, py1, px1, py2, px2, z0, z1, z2, bas
 
 
 @njit(cache=True)
-def render_model(img_mat, z_buf, v, f, light_vector, scale, shift_y, shift_x):
+def render_model(img_mat, z_buf, v, f, light_vector, scale, perspective):
     H = img_mat.shape[0]
     W = img_mat.shape[1]
 
@@ -57,9 +57,16 @@ def render_model(img_mat, z_buf, v, f, light_vector, scale, shift_y, shift_x):
         x2, y2, z2 = v[i2, 0], v[i2, 1], v[i2, 2]
 
         # Переводим мировые координаты в экранные
-        py0 = -y0 * scale + shift_y; px0 = x0 * scale + shift_x
-        py1 = -y1 * scale + shift_y; px1 = x1 * scale + shift_x
-        py2 = -y2 * scale + shift_y; px2 = x2 * scale + shift_x
+        if perspective:
+            if z0 <= 0.0 or z1 <= 0.0 or z2 <= 0.0: 
+                continue
+            py0 = (-y0 * scale)/z0 + H/2; px0 = (x0 * scale)/z0 + W/2
+            py1 = (-y1 * scale)/z1 + H/2; px1 = (x1 * scale)/z1 + W/2
+            py2 = (-y2 * scale)/z2 + H/2; px2 = (x2 * scale)/z2 + W/2
+        else:
+            py0 = -y0 * scale + H/2; px0 = x0 * scale + W/2
+            py1 = -y1 * scale + H/2; px1 = x1 * scale + W/2
+            py2 = -y2 * scale + H/2; px2 = x2 * scale + W/2
 
         # Нормаль к треугольнику (векторное произведение двух сторон)
         ax = x1 - x2; ay = y1 - y2; az = z1 - z2
@@ -82,9 +89,11 @@ def render_model(img_mat, z_buf, v, f, light_vector, scale, shift_y, shift_x):
 
 
 class Scene:
-    def __init__(self, filename: str | bytes | PathLike, rotation_angle: float = 0, light_vector = (0.0, 0.0, 1.0)):
+    def __init__(self, filename: str | bytes | PathLike, angles = (0.0, 0.0, 0.0), scale = 1.0, t_shift = (0.0, 0.0, 0.0), light_vector = (0.0, 0.0, 1.0)):
         self.light_vector = np.array(light_vector, dtype=np.float64)
-        self.rotation_angle = rotation_angle
+        self.shift = np.array(t_shift, dtype=np.float64)
+        self.angles = list(angles)
+        self.scale = scale
 
         v = []
         f = []
@@ -92,37 +101,60 @@ class Scene:
         with open(filename, "r") as file:
             for s in file:
                 sp = s.split()
+
+                if not sp:
+                    continue
                 
                 if sp[0] == "v":
                     v.append([float(sp[1]), float(sp[2]), float(sp[3])])
 
                 if sp[0] == "f":
-                    f.append([int(sp[1].split("/")[0]) - 1, int(sp[2].split("/")[0]) - 1, int(sp[3].split("/")[0]) - 1])
+                    points = [int(p.split("/")[0]) - 1 for p in sp[1:]]
+                    # points = [int(sp[1].split("/")[0]) - 1, int(sp[2].split("/")[0]) - 1, int(sp[3].split("/")[0]) - 1]
+                    for i in range(1, len(points) - 1):
+                        f.append([points[0], points[i], points[i + 1]])
 
         # Однородные numpy-массивы вместо списков списков для njit
-        self.v = np.array(v, dtype=np.float64)
+        self.v0 = np.array(v, dtype=np.float64) # исходные вершины
         self.f = np.array(f, dtype=np.int64)
 
-        # Поворот модели на ALPHA градусов вокруг оси Oy
-        x = self.v[:, 0].copy()
-        z = self.v[:, 2].copy()
-        self.v[:, 0] = x * cos(radians(rotation_angle)) + z * sin(radians(rotation_angle))
-        self.v[:, 2] = -x * sin(radians(rotation_angle)) + z * cos(radians(rotation_angle))
+        # Центрируем модель и вписываем в куб размером 1
+        vmin = self.v0.min(axis=0)
+        vmax = self.v0.max(axis=0)
+        print(vmin, vmax)
+        self.v0 = (self.v0 - (vmin + vmax) / 2) / (vmax - vmin).max()
+
+
+    def rotation_matrix(self):
+        a, b, g = np.radians(self.angles)
+
+        Rx = np.array([[1, 0, 0], [0, cos(a), sin(a)], [0, -sin(a), cos(a)]])
+        Ry = np.array([[cos(b), 0, sin(b)], [0, 1, 0], [-sin(b), 0, cos(b)]])
+        Rz = np.array([[cos(g), sin(g), 0], [-sin(g), cos(g), 0], [0, 0, 1]])
+
+        return Rx @ Ry @ Rz
+
+    def transform(self):
+        # Работаем со строкамии, поэтому матрица поворота транспонируется
+        return (self.scale * self.v0) @ self.rotation_matrix().T + self.shift
+    
+
 
 
 class Renderer:
-    def __init__(self, width: int = 1000, height: int = 1000, scale: int = 7000, shifts = (900, 500)):
+    def __init__(self, width: int = 1000, height: int = 1000, scale: int = 7000, perspective: bool = False):
         self.W = width
         self.H = height
         self.scale = float(scale)
-        self.shift_x, self.shift_y = float(shifts[1]), float(shifts[0])
+        self.perspective = perspective
         self.img_mat = np.zeros((height, width, 3), dtype=np.uint8)
         self.z_buf = np.full((height, width), np.inf, dtype=np.float32)
 
     def render(self, scene: Scene):
         self.img_mat.fill(0)
         self.z_buf.fill(np.inf)
-        render_model(self.img_mat, self.z_buf, scene.v, scene.f, scene.light_vector, float(self.scale), float(self.shift_y), float(self.shift_x))
+        v = scene.transform()
+        render_model(self.img_mat, self.z_buf, v, scene.f, scene.light_vector, float(self.scale), self.perspective)
 
     def save_image(self, filename: str | bytes | PathLike):
         Image.fromarray(self.img_mat).save(filename)
@@ -153,26 +185,65 @@ class App:
             self.render()
 
     def on_key(self, event):
-            k = event.keysym
-    
-            if k == 'plus':
-                self.renderer.scale *= 1.1
-            elif k == 'minus':
-                self.renderer.scale /= 1.1
-            # TODO
-            # elif k == 'q':
-            #     self.scene.rotation_angle -= 10
-            # elif k == 'e':
-            #     self.scene.rotation_angle += 10
-            elif k == 'space':
-                self.renderer.save_image('imgs\\app_output.png')
-                return 'break'
-            else:
-                return
-    
-            self.render()
-            # Не обрабатываем дальше – return 'brake'
+        k = event.keysym
+        step = 0.01  # шаг сдвига в единицах obj
+
+        # Масштаб экранных координат (a)
+        if k in ('plus', 'equal', 'KP_Add'):
+            self.renderer.scale *= 1.1
+        elif k in ('minus', 'KP_Subtract'):
+            self.renderer.scale /= 1.1
+
+        # Поворот вокруг оси Y
+        elif k == 'q':
+            self.scene.angles[1] -= 10
+        elif k == 'e':
+            self.scene.angles[1] += 10
+
+        # Поворот вокруг оси X
+        elif k == 't':
+            self.scene.angles[0] -= 10
+        elif k == 'g':
+            self.scene.angles[0] += 10
+
+        # Поворот вокруг оси Z
+        elif k == 'y':
+            self.scene.angles[2] -= 10
+        elif k == 'h':
+            self.scene.angles[2] += 10
+
+        # Сдвиг по X и Y
+        elif k == 'Left':
+            self.scene.shift[0] -= step
+        elif k == 'Right':
+            self.scene.shift[0] += step
+        elif k == 'Up':
+            self.scene.shift[1] += step
+        elif k == 'Down':
+            self.scene.shift[1] -= step
+
+        # Сдвиг по Z (не даём уйти за камеру)
+        elif k == 'w':
+            self.scene.shift[2] += step
+        elif k == 's':
+            self.scene.shift[2] = max(0.1, self.scene.shift[2] - step)
+
+        # Переключение параллельной и перспективной проекции
+        elif k == 'p':
+            self.renderer.perspective = not self.renderer.perspective
+
+        # Сохранение кадра
+        elif k == 'space':
+            self.renderer.save_image('imgs\\app_output.png')
             return 'break'
+
+        else:
+            return
+
+        self.render()
+        # Не обрабатываем дальше – return 'brake'
+        return 'break'
+    
 
     def render(self):
         self.renderer.render(self.scene)
@@ -203,8 +274,9 @@ class App:
 
 
 if __name__ == '__main__':
-    scene = Scene('model.obj', 180)
-    renderer = Renderer(1000, 1000, 7000)
+    # scene = Scene('objs\\12221_Cat_v1_l3.obj', angles=(0.0, 180.0, 0.0), scale=1.0, t_shift=(0.0, -0.057, 1.0))
+    scene = Scene('objs\\12221_Cat_v1_l3.obj', angles=(0.0, 180.0, 0.0), scale=1.0, t_shift=(0.0, 0.0, 2.0))
+    renderer = Renderer(1000, 1000, 7000, perspective=True)
     # renderer.render(scene)
     # renderer.save_image('imgs\\output.png')
     App(scene, renderer, 500, 500).run()
